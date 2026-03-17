@@ -4,21 +4,27 @@
 #include <vector>
 #include <algorithm>
 #include <deque>
+#include <cmath>
 #include "OrderBook.h"
+#include "MatchingEngine.h"
+#include "Journal.h"
+#include "FIXParser.h"
 #include "Types.h"
+#include <thread>
 
 using namespace OrderMatcher;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Original Tests (preserved)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 void testBasicMatching() {
     std::cout << "Running testBasicMatching..." << std::endl;
     OrderBook book;
-    
-    // Participant 1 Sell 100 @ 100.00
+
     book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Limit);
-    
-    // Participant 2 Buy 100 @ 100.00
     book.addOrder(2, 2, Side::Buy, 1000000, 100, OrderType::Limit);
-    
+
     assert(book.getOrder(1) == nullptr);
     assert(book.getOrder(2) == nullptr);
     assert(book.getAskLevelsCount() == 0);
@@ -29,15 +35,12 @@ void testBasicMatching() {
 void testSMP() {
     std::cout << "Running testSMP..." << std::endl;
     OrderBook book;
-    
-    // Participant 1 Sell 100 @ 100.00
+
     book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Limit);
-    
-    // Participant 1 Buy 100 @ 100.00 (Should trigger SMP and cancel incoming)
     book.addOrder(2, 1, Side::Buy, 1000000, 100, OrderType::Limit);
-    
-    assert(book.getOrder(1) != nullptr); // Resting order should remain
-    assert(book.getOrder(2) == nullptr); // Incoming order should be cancelled
+
+    assert(book.getOrder(1) != nullptr);
+    assert(book.getOrder(2) == nullptr);
     assert(book.getAskLevelsCount() == 1);
     std::cout << "testSMP PASSED" << std::endl;
 }
@@ -45,12 +48,11 @@ void testSMP() {
 void testMarketOrder() {
     std::cout << "Running testMarketOrder..." << std::endl;
     OrderBook book;
-    book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Limit); // 100 @ 100.00
-    book.addOrder(2, 2, Side::Sell, 1010000, 100, OrderType::Limit); // 100 @ 101.00
-    
-    // Market Buy 150
+    book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Limit);
+    book.addOrder(2, 2, Side::Sell, 1010000, 100, OrderType::Limit);
+
     book.addOrder(3, 3, Side::Buy, 0, 150, OrderType::Market);
-    
+
     assert(book.getOrder(1) == nullptr);
     const Order* order2 = book.getOrder(2);
     assert(order2 != nullptr && order2->remainingQty == 50);
@@ -62,10 +64,9 @@ void testIOC() {
     std::cout << "Running testIOC..." << std::endl;
     OrderBook book;
     book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Limit);
-    
-    // IOC Buy 150 @ 100.00 (Should match 100 and cancel 50)
+
     book.addOrder(2, 2, Side::Buy, 1000000, 150, OrderType::IOC);
-    
+
     assert(book.getOrder(1) == nullptr);
     assert(book.getOrder(2) == nullptr);
     assert(book.getBidLevelsCount() == 0);
@@ -76,14 +77,12 @@ void testFOK() {
     std::cout << "Running testFOK..." << std::endl;
     OrderBook book;
     book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Limit);
-    
-    // FOK Buy 150 @ 100.00 (Should KILL because not enough liquidity)
+
     book.addOrder(2, 2, Side::Buy, 1000000, 150, OrderType::FOK);
-    
-    assert(book.getOrder(1) != nullptr); // 100 @ 100.00 remains
+
+    assert(book.getOrder(1) != nullptr);
     assert(book.getOrder(2) == nullptr);
-    
-    // FOK Buy 100 @ 100.00 (Should FILL)
+
     book.addOrder(3, 3, Side::Buy, 1000000, 100, OrderType::FOK);
     assert(book.getOrder(1) == nullptr);
     assert(book.getOrder(3) == nullptr);
@@ -93,20 +92,16 @@ void testFOK() {
 void testStopOrder() {
     std::cout << "Running testStopOrder..." << std::endl;
     OrderBook book;
-    
-    // Stop Buy @ 105.00
+
     book.addOrder(1, 1, Side::Buy, 1050000, 100, OrderType::Stop, 1050000);
-    
-    // Trade occurs at 104.00 (No trigger)
+
     book.addOrder(2, 2, Side::Sell, 1040000, 50, OrderType::Limit);
     book.addOrder(3, 3, Side::Buy, 1040000, 50, OrderType::Limit);
     assert(book.getOrder(1) != nullptr);
-    
-    // Trade occurs at 105.00 (TRIGGERS!)
+
     book.addOrder(4, 4, Side::Sell, 1050000, 50, OrderType::Limit);
     book.addOrder(5, 5, Side::Buy, 1050000, 50, OrderType::Limit);
-    
-    // Order 1 should now be in the book as a Limit Buy @ 105.00
+
     assert(book.getBidLevelsCount() == 1);
     const Order* order1 = book.getOrder(1);
     assert(order1 != nullptr && order1->type == OrderType::Limit);
@@ -116,28 +111,15 @@ void testStopOrder() {
 void testIcebergOrder() {
     std::cout << "Running testIcebergOrder..." << std::endl;
     OrderBook book;
-    
-    // Iceberg Sell 100, Visible 30 @ 100.00
+
     book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Iceberg, 0, 30);
-    
-    // Match 20 (Visible remains 10)
+
     book.addOrder(2, 2, Side::Buy, 1000000, 20, OrderType::Limit);
     const Order* order1 = book.getOrder(1);
     assert(order1->visibleQty == 10);
     assert(order1->remainingQty == 80);
-    
-    // Match 15 (Visible refills to 30, loses priority?)
-    // In this test, it's the only one, so priority doesn't matter much yet
+
     book.addOrder(3, 3, Side::Buy, 1000000, 15, OrderType::Limit);
-    assert(order1->visibleQty == 25); // 10-15 = refills from reserve. Wait, 10 - 15? 
-    // Logic was: fillQty = min(incoming, visible). 
-    // incoming 15, visible 10. fillQty = 10.
-    // remainingQty 80-10=70. visible 10-10=0.
-    // refill: visible = min(70, 30) = 30.
-    // incoming remaining = 15-10 = 5.
-    // Next iteration of match: bookOrder is still order1 (it moved to back but only child).
-    // visible 30. fillQty = min(5, 30) = 5.
-    // remainingQty 70-5=65. visible 30-5=25.
     assert(order1->visibleQty == 25);
     assert(order1->remainingQty == 65);
     std::cout << "testIcebergOrder PASSED" << std::endl;
@@ -146,37 +128,28 @@ void testIcebergOrder() {
 void testAnalytics() {
     std::cout << "Running testAnalytics..." << std::endl;
     OrderBook book;
-    
-    // Trade @ 100
+
     book.addOrder(1, 10, Side::Sell, 1000000, 100, OrderType::Limit);
     book.addOrder(2, 20, Side::Buy, 1000000, 100, OrderType::Limit);
     assert(book.getVWAP() == 1000000);
-    
-    // Trade @ 102
+
     book.addOrder(3, 10, Side::Sell, 1020000, 100, OrderType::Limit);
     book.addOrder(4, 30, Side::Buy, 1020000, 100, OrderType::Limit);
     assert(book.getVWAP() == 1010000);
-    
-    // OTR Check
-    // Participant 10: 2 Adds (1, 3), 2 Trades. Ratio 1.0
-    // Participant 30: 1 Add (4), 1 Trade. Ratio 1.0
+
     assert(book.getOTR(10) == 1.0);
     assert(book.getOTR(30) == 1.0);
-    
+
     std::cout << "testAnalytics PASSED" << std::endl;
 }
 
 void testCircuitBreaker() {
     std::cout << "Running testCircuitBreaker..." << std::endl;
     OrderBook book;
-    
-    // Anchor price @ 100
+
     book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit);
-    
-    // Order @ 106 (6% deviation) -> Should HALT
     book.addOrder(2, 2, Side::Buy, 1060000, 100, OrderType::Limit);
-    
-    // Subsequent order should be rejected
+
     book.addOrder(3, 3, Side::Sell, 1000000, 100, OrderType::Limit);
     assert(book.getOrder(3) == nullptr);
     std::cout << "testCircuitBreaker PASSED" << std::endl;
@@ -192,11 +165,11 @@ void testStress() {
 
     for (int i = 0; i < 10000; ++i) {
         int op = opDist(rng);
-        if (op <= 70) { // Add
+        if (op <= 70) {
             OrderId id = i + 1;
             orders.push_back(id);
             book.addOrder(id, 1, (i % 2 == 0 ? Side::Buy : Side::Sell), priceDist(rng), 10, OrderType::Limit);
-        } else if (!orders.empty()) { // Cancel
+        } else if (!orders.empty()) {
             size_t idx = rng() % orders.size();
             book.cancelOrder(orders[idx]);
             orders[idx] = orders.back();
@@ -209,27 +182,19 @@ void testStress() {
 void testPartialFillPriority() {
     std::cout << "Running testPartialFillPriority..." << std::endl;
     OrderBook book;
-    
-    // 1. Add Buy 100 @ 100 (Order 1)
+
     book.addOrder(1, 10, Side::Buy, 1000000, 100, OrderType::Limit);
-    // 2. Add Buy 100 @ 100 (Order 2)
     book.addOrder(2, 20, Side::Buy, 1000000, 100, OrderType::Limit);
-    
-    // 3. Sell 50 @ 100 -> Should match Order 1 partially
+
     book.addOrder(3, 30, Side::Sell, 1000000, 50, OrderType::Limit);
-    
-    // 4. Verify Order 1 still has 50 left and is still at the top
     assert(book.getTradeHistory().back().buyOrderId == 1);
     assert(book.getTradeHistory().back().quantity == 50);
-    
-    // 5. Sell 100 @ 100 -> Should match remaining 50 of Order 1, then 50 of Order 2
+
     book.addOrder(4, 30, Side::Sell, 1000000, 100, OrderType::Limit);
     auto history = book.getTradeHistory();
-    // history[-1] is Sell(4) vs Buy(2) for 50
-    // history[-2] is Sell(4) vs Buy(1) for 50
     assert(history[history.size()-2].buyOrderId == 1);
     assert(history[history.size()-1].buyOrderId == 2);
-    
+
     std::cout << "testPartialFillPriority PASSED" << std::endl;
 }
 
@@ -244,19 +209,18 @@ void testFuzz(int numOps) {
 
     for (int i = 0; i < numOps; ++i) {
         int op = opDist(rng);
-        if (op <= 50) { // Add
+        if (op <= 50) {
             OrderId id = nextId++;
             activeOrders.push_back(id);
             book.addOrder(id, (i%10)+1, (i%2==0 ? Side::Buy : Side::Sell), priceDist(rng)*1000, 100, OrderType::Limit);
-        } else if (op <= 90 && !activeOrders.empty()) { // Cancel
+        } else if (op <= 90 && !activeOrders.empty()) {
             size_t idx = rng() % activeOrders.size();
             book.cancelOrder(activeOrders[idx]);
             activeOrders.erase(activeOrders.begin() + idx);
-        } else { // Market
+        } else {
             book.addOrder(nextId++, 99, (i%2==0 ? Side::Buy : Side::Sell), 0, 50, OrderType::Market);
         }
-        
-        // Invariant check: Best Bid < Best Ask
+
         Price bb = book.getBestBid();
         Price ba = book.getBestAsk();
         if (bb != 0 && ba != std::numeric_limits<Price>::max()) {
@@ -269,44 +233,1246 @@ void testFuzz(int numOps) {
 void testSMPPurity() {
     std::cout << "Running testSMPPurity..." << std::endl;
     OrderBook book;
-    // Participant 1 adds a Buy order
     book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit);
-    // Participant 1 adds a Sell order at the same price -> Should NOT match
     book.addOrder(2, 1, Side::Sell, 1000000, 100, OrderType::Limit);
-    
+
     assert(book.getTradeCount() == 0);
     assert(book.getBidLevelsCount() == 1);
-    assert(book.getAskLevelsCount() == 0); // Corrected: Taker is cancelled on SMP
-    
-    // Participant 2 adds a Sell order at the same price -> SHOULD match
+    assert(book.getAskLevelsCount() == 0);
+
     book.addOrder(3, 2, Side::Sell, 1000000, 100, OrderType::Limit);
     assert(book.getTradeCount() == 1);
-    
+
     std::cout << "testSMPPurity PASSED" << std::endl;
 }
 
 void testCircuitBreakerBoundaries() {
     std::cout << "Running testCircuitBreakerBoundaries..." << std::endl;
     OrderBook book;
-    // Reference price set at 1,000,000 via first order
     book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit);
-    
-    // 4.9% movement -> Should be OK
+
     book.addOrder(2, 2, Side::Sell, 1049000, 100, OrderType::Limit);
-    assert(book.getTradeCount() == 0); // No match but order accepted
-    
-    // 5.1% movement -> Should trigger HALT
+    assert(book.getTradeCount() == 0);
+
     book.addOrder(3, 3, Side::Buy, 1051000, 100, OrderType::Limit);
-    
-    // Try to match in halted state
+
     book.addOrder(4, 4, Side::Sell, 1000000, 100, OrderType::Limit);
-    assert(book.getTradeCount() == 0); // No match because it's halted or rejected
-    
+    assert(book.getTradeCount() == 0);
+
     std::cout << "testCircuitBreakerBoundaries PASSED" << std::endl;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// New Feature Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Stop-Limit Orders ──────────────────────────────────────────────────────
+
+void testStopLimitOrder() {
+    std::cout << "Running testStopLimitOrder..." << std::endl;
+    OrderBook book;
+
+    // Stop-Limit Buy: trigger at 105, limit at 104
+    // stopPrice=1050000, stopLimitPrice=1040000
+    book.addOrder(1, 1, Side::Buy, 1040000, 100, OrderType::StopLimit, 1050000, 0,
+                  TimeInForce::GTC, 0, 1040000);
+
+    // Trade at 104 -> no trigger
+    book.addOrder(2, 2, Side::Sell, 1040000, 50, OrderType::Limit);
+    book.addOrder(3, 3, Side::Buy, 1040000, 50, OrderType::Limit);
+    assert(book.getOrder(1) != nullptr);
+
+    // Trade at 105 -> TRIGGER! Order becomes Limit Buy @ 104
+    book.addOrder(4, 4, Side::Sell, 1050000, 50, OrderType::Limit);
+    book.addOrder(5, 5, Side::Buy, 1050000, 50, OrderType::Limit);
+
+    const Order* order1 = book.getOrder(1);
+    assert(order1 != nullptr);
+    assert(order1->type == OrderType::Limit);
+    assert(order1->price == 1040000);  // limit price, not stop price
+    assert(order1->isStopTriggered == true);
+
+    std::cout << "testStopLimitOrder PASSED" << std::endl;
+}
+
+// ─── Post-Only Orders ───────────────────────────────────────────────────────
+
+void testPostOnly() {
+    std::cout << "Running testPostOnly..." << std::endl;
+    OrderBook book;
+
+    // Resting sell @ 100
+    book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Limit);
+
+    // Post-Only Buy @ 100 -> would cross -> REJECT
+    book.addOrder(2, 2, Side::Buy, 1000000, 50, OrderType::PostOnly);
+    assert(book.getOrder(2) == nullptr);
+    assert(book.getOrder(1) != nullptr);
+    assert(book.getOrder(1)->remainingQty == 100); // not matched
+
+    // Post-Only Buy @ 99 -> won't cross -> ACCEPT
+    book.addOrder(3, 3, Side::Buy, 990000, 50, OrderType::PostOnly);
+    assert(book.getOrder(3) != nullptr);
+    assert(book.getBidLevelsCount() == 1);
+
+    // Post-Only Sell @ 101 -> won't cross -> ACCEPT
+    book.addOrder(4, 4, Side::Sell, 1010000, 50, OrderType::PostOnly);
+    assert(book.getOrder(4) != nullptr);
+
+    // Post-Only Sell @ 99 -> would cross (bid at 99) -> REJECT
+    book.addOrder(5, 5, Side::Sell, 990000, 50, OrderType::PostOnly);
+    assert(book.getOrder(5) == nullptr);
+
+    std::cout << "testPostOnly PASSED" << std::endl;
+}
+
+// ─── Hidden Orders ──────────────────────────────────────────────────────────
+
+void testHiddenOrders() {
+    std::cout << "Running testHiddenOrders..." << std::endl;
+    OrderBook book;
+
+    // Hidden buy @ 100
+    book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Hidden);
+    assert(book.getOrder(1) != nullptr);
+    assert(book.getOrder(1)->isHidden == true);
+    assert(book.getBidLevelsCount() == 1);
+
+    // Market data snapshot should NOT show hidden orders
+    auto snap = book.getSnapshot();
+    assert(snap.bids.empty()); // hidden order not visible
+
+    // But hidden orders SHOULD match
+    book.addOrder(2, 2, Side::Sell, 1000000, 50, OrderType::Limit);
+    assert(book.getOrder(2) == nullptr); // matched
+    const Order* o1 = book.getOrder(1);
+    assert(o1 != nullptr && o1->remainingQty == 50);
+
+    // Can also use hidden flag on limit orders
+    book.addOrder(3, 3, Side::Sell, 1010000, 100, OrderType::Limit, 0, 0,
+                  TimeInForce::GTC, 0, 0, PegType::None, 0, 0, 0, true);
+    assert(book.getOrder(3) != nullptr);
+    assert(book.getOrder(3)->isHidden == true);
+
+    std::cout << "testHiddenOrders PASSED" << std::endl;
+}
+
+// ─── Cancel/Replace ─────────────────────────────────────────────────────────
+
+void testCancelReplace() {
+    std::cout << "Running testCancelReplace..." << std::endl;
+    OrderBook book;
+
+    // Buy 100 @ 100
+    book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit);
+    assert(book.getBidLevelsCount() == 1);
+
+    // Cancel/Replace: change price to 101, qty to 80
+    bool ok = book.cancelReplace(1, 1010000, 80);
+    assert(ok);
+    const Order* o = book.getOrder(1);
+    assert(o != nullptr);
+    assert(o->price == 1010000);
+    assert(o->remainingQty == 80);
+
+    // Cancel/Replace: same price, reduce qty (preserves priority)
+    ok = book.cancelReplace(1, 1010000, 50);
+    assert(ok);
+    assert(book.getOrder(1)->remainingQty == 50);
+
+    // Cancel/Replace: same price, increase qty (loses priority)
+    book.addOrder(2, 2, Side::Buy, 1010000, 100, OrderType::Limit);
+    ok = book.cancelReplace(1, 1010000, 200);
+    assert(ok);
+    // Order 2 should now have priority over order 1
+
+    // Sell 50 -> should match order 2 first (has priority)
+    book.addOrder(3, 3, Side::Sell, 1010000, 50, OrderType::Limit);
+    auto history = book.getTradeHistory();
+    assert(history.back().buyOrderId == 2);
+
+    std::cout << "testCancelReplace PASSED" << std::endl;
+}
+
+void testCancelReplaceCrossing() {
+    std::cout << "Running testCancelReplaceCrossing..." << std::endl;
+    OrderBook book;
+
+    // Resting sell @ 100
+    book.addOrder(1, 1, Side::Sell, 1000000, 50, OrderType::Limit);
+
+    // Resting buy @ 99
+    book.addOrder(2, 2, Side::Buy, 990000, 100, OrderType::Limit);
+
+    // Cancel/Replace buy to 100 -> should cross and match
+    bool ok = book.cancelReplace(2, 1000000, 100);
+    assert(ok);
+
+    // Sell order 1 should be fully filled
+    assert(book.getOrder(1) == nullptr);
+
+    // Buy order 2 should have 50 remaining
+    const Order* o2 = book.getOrder(2);
+    assert(o2 != nullptr);
+    assert(o2->remainingQty == 50);
+    assert(o2->price == 1000000);
+
+    std::cout << "testCancelReplaceCrossing PASSED" << std::endl;
+}
+
+// ─── Kill Switch ────────────────────────────────────────────────────────────
+
+void testKillSwitch() {
+    std::cout << "Running testKillSwitch..." << std::endl;
+    OrderBook book;
+
+    // Participant 1: multiple orders
+    book.addOrder(1, 1, Side::Buy, 990000, 100, OrderType::Limit);
+    book.addOrder(2, 1, Side::Buy, 980000, 100, OrderType::Limit);
+    book.addOrder(3, 1, Side::Sell, 1010000, 100, OrderType::Limit);
+
+    // Participant 2: one order
+    book.addOrder(4, 2, Side::Buy, 995000, 100, OrderType::Limit);
+
+    assert(book.getBidLevelsCount() == 3);
+    assert(book.getAskLevelsCount() == 1);
+
+    // Kill switch for participant 1
+    uint64_t cancelled = book.cancelAllForParticipant(1);
+    assert(cancelled == 3);
+
+    assert(book.getOrder(1) == nullptr);
+    assert(book.getOrder(2) == nullptr);
+    assert(book.getOrder(3) == nullptr);
+    assert(book.getOrder(4) != nullptr);
+    assert(book.getBidLevelsCount() == 1); // only participant 2's order remains
+    assert(book.getAskLevelsCount() == 0);
+
+    std::cout << "testKillSwitch PASSED" << std::endl;
+}
+
+// ─── Time-in-Force: GTD ─────────────────────────────────────────────────────
+
+void testGTDExpiry() {
+    std::cout << "Running testGTDExpiry..." << std::endl;
+    OrderBook book;
+
+    uint64_t now = 1000000000;
+    uint64_t expiry = now + 100;
+
+    // GTD order that expires at now+100
+    book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit, 0, 0,
+                  TimeInForce::GTD, expiry);
+    assert(book.getOrder(1) != nullptr);
+
+    // Not expired yet
+    book.expireOrders(now + 50);
+    assert(book.getOrder(1) != nullptr);
+
+    // Expired
+    book.expireOrders(now + 100);
+    assert(book.getOrder(1) == nullptr);
+
+    std::cout << "testGTDExpiry PASSED" << std::endl;
+}
+
+void testDAYExpiry() {
+    std::cout << "Running testDAYExpiry..." << std::endl;
+    OrderBook book;
+
+    uint64_t sessionEnd = 2000000000;
+
+    // DAY order
+    book.addOrder(1, 1, Side::Sell, 1010000, 100, OrderType::Limit, 0, 0,
+                  TimeInForce::DAY, sessionEnd);
+    // GTC order (should NOT expire)
+    book.addOrder(2, 2, Side::Sell, 1020000, 100, OrderType::Limit);
+
+    assert(book.getOrder(1) != nullptr);
+    assert(book.getOrder(2) != nullptr);
+
+    // End of day
+    book.expireOrders(sessionEnd);
+    assert(book.getOrder(1) == nullptr); // DAY expired
+    assert(book.getOrder(2) != nullptr); // GTC survives
+
+    std::cout << "testDAYExpiry PASSED" << std::endl;
+}
+
+// ─── Pre-trade Risk Checks ──────────────────────────────────────────────────
+
+void testRiskLimits() {
+    std::cout << "Running testRiskLimits..." << std::endl;
+    OrderBook book;
+
+    RiskLimits limits;
+    limits.maxOrderSize = 500;
+    limits.maxOrderNotional = 10000000; // 1000.00 in fixed point
+    book.setRiskLimits(1, limits);
+
+    // Within limits
+    book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit);
+    assert(book.getOrder(1) != nullptr);
+
+    // Exceeds max order size
+    book.addOrder(2, 1, Side::Buy, 1000000, 600, OrderType::Limit);
+    assert(book.getOrder(2) == nullptr); // rejected
+
+    // No limits for participant 2
+    book.addOrder(3, 2, Side::Buy, 1000000, 600, OrderType::Limit);
+    assert(book.getOrder(3) != nullptr);
+
+    std::cout << "testRiskLimits PASSED" << std::endl;
+}
+
+// ─── Market Data Snapshot ───────────────────────────────────────────────────
+
+void testMarketDataSnapshot() {
+    std::cout << "Running testMarketDataSnapshot..." << std::endl;
+    OrderBook book;
+
+    // Build order book
+    book.addOrder(1, 1, Side::Buy, 990000, 100, OrderType::Limit);
+    book.addOrder(2, 2, Side::Buy, 990000, 50, OrderType::Limit);
+    book.addOrder(3, 3, Side::Buy, 980000, 200, OrderType::Limit);
+
+    book.addOrder(4, 4, Side::Sell, 1010000, 100, OrderType::Limit);
+    book.addOrder(5, 5, Side::Sell, 1020000, 150, OrderType::Limit);
+
+    auto snap = book.getSnapshot(5);
+
+    assert(snap.bids.size() == 2);
+    assert(snap.asks.size() == 2);
+
+    // Best bid level
+    assert(snap.bids[0].price == 990000);
+    assert(snap.bids[0].totalQuantity == 150); // 100 + 50
+    assert(snap.bids[0].orderCount == 2);
+
+    // Second bid level
+    assert(snap.bids[1].price == 980000);
+    assert(snap.bids[1].totalQuantity == 200);
+
+    // Best ask level
+    assert(snap.asks[0].price == 1010000);
+    assert(snap.asks[0].totalQuantity == 100);
+
+    std::cout << "testMarketDataSnapshot PASSED" << std::endl;
+}
+
+void testMarketDataHidesHiddenOrders() {
+    std::cout << "Running testMarketDataHidesHiddenOrders..." << std::endl;
+    OrderBook book;
+
+    // Visible order
+    book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit);
+    // Hidden order at same price
+    book.addOrder(2, 2, Side::Buy, 1000000, 200, OrderType::Hidden);
+
+    auto snap = book.getSnapshot();
+    assert(snap.bids.size() == 1);
+    assert(snap.bids[0].totalQuantity == 100); // only visible qty
+    assert(snap.bids[0].orderCount == 1);
+
+    std::cout << "testMarketDataHidesHiddenOrders PASSED" << std::endl;
+}
+
+// ─── Order Status Notifications ─────────────────────────────────────────────
+
+void testOrderStatusCallbacks() {
+    std::cout << "Running testOrderStatusCallbacks..." << std::endl;
+    OrderBook book;
+
+    std::vector<OrderUpdate> updates;
+    book.setOrderUpdateCallback([&](const OrderUpdate& u) {
+        updates.push_back(u);
+    });
+
+    // Add and match
+    book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Limit);
+    book.addOrder(2, 2, Side::Buy, 1000000, 100, OrderType::Limit);
+
+    // Should have: Accepted(1), Accepted(2), Filled(1), Filled(2)
+    bool found_accept_1 = false, found_accept_2 = false;
+    bool found_fill_1 = false, found_fill_2 = false;
+
+    for (const auto& u : updates) {
+        if (u.orderId == 1 && u.status == OrderStatus::Accepted) found_accept_1 = true;
+        if (u.orderId == 2 && u.status == OrderStatus::Accepted) found_accept_2 = true;
+        if (u.orderId == 1 && u.status == OrderStatus::Filled) found_fill_1 = true;
+        if (u.orderId == 2 && u.status == OrderStatus::Filled) found_fill_2 = true;
+    }
+
+    assert(found_accept_1);
+    assert(found_accept_2);
+    assert(found_fill_1);
+    assert(found_fill_2);
+
+    std::cout << "testOrderStatusCallbacks PASSED" << std::endl;
+}
+
+void testOrderStatusRejection() {
+    std::cout << "Running testOrderStatusRejection..." << std::endl;
+    OrderBook book;
+
+    std::vector<OrderUpdate> updates;
+    book.setOrderUpdateCallback([&](const OrderUpdate& u) {
+        updates.push_back(u);
+    });
+
+    // FOK with insufficient liquidity -> rejected
+    book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::FOK);
+
+    bool foundReject = false;
+    for (const auto& u : updates) {
+        if (u.orderId == 1 && u.status == OrderStatus::Rejected
+            && u.rejectReason == RejectReason::FOKInsufficientLiquidity) {
+            foundReject = true;
+        }
+    }
+    assert(foundReject);
+
+    std::cout << "testOrderStatusRejection PASSED" << std::endl;
+}
+
+// ─── Trailing Stop ──────────────────────────────────────────────────────────
+
+void testTrailingStopSell() {
+    std::cout << "Running testTrailingStopSell..." << std::endl;
+    OrderBook book;
+
+    // Seed with a trade so lastTradePrice is set
+    book.addOrder(10, 10, Side::Sell, 1000000, 10, OrderType::Limit);
+    book.addOrder(11, 11, Side::Buy, 1000000, 10, OrderType::Limit);
+    // lastTradePrice = 100.00
+
+    // Trailing Stop Sell: trail by 20000 (2.00)
+    // trailRefPrice = 100.00, stopPrice = 98.00
+    book.addOrder(1, 1, Side::Sell, 1000000, 50, OrderType::TrailingStop, 0, 0,
+                  TimeInForce::GTC, 0, 0, PegType::None, 0, 20000);
+    const Order* ts = book.getOrder(1);
+    assert(ts != nullptr);
+    assert(ts->trailRefPrice == 1000000);
+    assert(ts->stopPrice == 980000);
+
+    // Price goes up to 102 -> trailRef should update to 102, stop = 100
+    book.addOrder(20, 20, Side::Sell, 1020000, 10, OrderType::Limit);
+    book.addOrder(21, 21, Side::Buy, 1020000, 10, OrderType::Limit);
+
+    ts = book.getOrder(1);
+    assert(ts != nullptr);
+    assert(ts->trailRefPrice == 1020000);
+    assert(ts->stopPrice == 1000000);
+
+    // Price drops to 100 -> triggers stop at 100
+    // Need a resting bid for the triggered sell to match
+    book.addOrder(30, 30, Side::Buy, 1000000, 100, OrderType::Limit);
+    book.addOrder(31, 31, Side::Sell, 1000000, 10, OrderType::Limit);
+    book.addOrder(32, 32, Side::Buy, 1000000, 10, OrderType::Limit);
+
+    // Check if trailing stop was triggered
+    // The order should have been converted to limit and matched or resting
+    ts = book.getOrder(1);
+    if (ts != nullptr) {
+        assert(ts->type == OrderType::Limit);
+    }
+
+    std::cout << "testTrailingStopSell PASSED" << std::endl;
+}
+
+void testTrailingStopBuy() {
+    std::cout << "Running testTrailingStopBuy..." << std::endl;
+    OrderBook book;
+
+    // Seed trade at 100
+    book.addOrder(10, 10, Side::Sell, 1000000, 10, OrderType::Limit);
+    book.addOrder(11, 11, Side::Buy, 1000000, 10, OrderType::Limit);
+
+    // Trailing Stop Buy: trail by 10000 (1.00)
+    // trailRefPrice = 100.00, stopPrice = 101.00
+    book.addOrder(1, 1, Side::Buy, 1000000, 50, OrderType::TrailingStop, 0, 0,
+                  TimeInForce::GTC, 0, 0, PegType::None, 0, 10000);
+
+    const Order* ts = book.getOrder(1);
+    assert(ts != nullptr);
+    assert(ts->trailRefPrice == 1000000);
+    assert(ts->stopPrice == 1010000);
+
+    // Price drops to 99 -> trailRef = 99, stop = 100
+    book.addOrder(20, 20, Side::Sell, 990000, 10, OrderType::Limit);
+    book.addOrder(21, 21, Side::Buy, 990000, 10, OrderType::Limit);
+
+    ts = book.getOrder(1);
+    assert(ts != nullptr);
+    assert(ts->trailRefPrice == 990000);
+    assert(ts->stopPrice == 1000000);
+
+    std::cout << "testTrailingStopBuy PASSED" << std::endl;
+}
+
+// ─── Pegged Orders ──────────────────────────────────────────────────────────
+
+void testPeggedMidPrice() {
+    std::cout << "Running testPeggedMidPrice..." << std::endl;
+    OrderBook book;
+
+    // Build book: bid 99, ask 101
+    book.addOrder(1, 1, Side::Buy, 990000, 100, OrderType::Limit);
+    book.addOrder(2, 2, Side::Sell, 1010000, 100, OrderType::Limit);
+
+    // Mid-peg buy with 0 offset -> should peg at (99+101)/2 = 100
+    book.addOrder(3, 3, Side::Buy, 1000000, 50, OrderType::Pegged, 0, 0,
+                  TimeInForce::GTC, 0, 0, PegType::MidPeg, 0);
+
+    const Order* peg = book.getOrder(3);
+    assert(peg != nullptr);
+    assert(peg->price == 1000000); // mid-price
+
+    std::cout << "testPeggedMidPrice PASSED" << std::endl;
+}
+
+void testPeggedPrimaryPeg() {
+    std::cout << "Running testPeggedPrimaryPeg..." << std::endl;
+    OrderBook book;
+
+    // Build book: bid 99, ask 101
+    book.addOrder(1, 1, Side::Buy, 990000, 100, OrderType::Limit);
+    book.addOrder(2, 2, Side::Sell, 1010000, 100, OrderType::Limit);
+
+    // Primary-peg buy with +1000 offset -> pegs at best_bid + 0.10 = 99.10
+    book.addOrder(3, 3, Side::Buy, 990000, 50, OrderType::Pegged, 0, 0,
+                  TimeInForce::GTC, 0, 0, PegType::PrimaryPeg, 1000);
+
+    const Order* peg = book.getOrder(3);
+    assert(peg != nullptr);
+    assert(peg->price == 991000); // 99.00 + 0.10
+
+    std::cout << "testPeggedPrimaryPeg PASSED" << std::endl;
+}
+
+// ─── Minimum Execution Quantity ─────────────────────────────────────────────
+
+void testMinQty() {
+    std::cout << "Running testMinQty..." << std::endl;
+    OrderBook book;
+
+    // Resting sell 30 @ 100
+    book.addOrder(1, 1, Side::Sell, 1000000, 30, OrderType::Limit);
+
+    // Buy 100 with minQty 50 -> only 30 available, won't match, rests in book
+    book.addOrder(2, 2, Side::Buy, 1000000, 100, OrderType::Limit, 0, 0,
+                  TimeInForce::GTC, 0, 0, PegType::None, 0, 0, 50);
+    assert(book.getOrder(1) != nullptr); // sell still resting
+    assert(book.getOrder(2) != nullptr); // buy resting (minQty not met)
+
+    // IOC with minQty that can't be met -> cancel
+    book.addOrder(3, 3, Side::Buy, 1000000, 100, OrderType::IOC, 0, 0,
+                  TimeInForce::GTC, 0, 0, PegType::None, 0, 0, 50);
+    assert(book.getOrder(3) == nullptr); // cancelled
+
+    std::cout << "testMinQty PASSED" << std::endl;
+}
+
+// ─── Pro-Rata Matching ──────────────────────────────────────────────────────
+
+void testProRataMatching() {
+    std::cout << "Running testProRataMatching..." << std::endl;
+    OrderBook book(0, MatchAlgorithm::ProRata);
+
+    // Three resting sells at 100: 100, 200, 300 qty
+    book.addOrder(1, 1, Side::Sell, 1000000, 100, OrderType::Limit);
+    book.addOrder(2, 2, Side::Sell, 1000000, 200, OrderType::Limit);
+    book.addOrder(3, 3, Side::Sell, 1000000, 300, OrderType::Limit);
+    // Total: 600
+
+    // Buy 300 @ 100 -> pro-rata should allocate proportionally
+    // Order 1: 100/600 * 300 = 50
+    // Order 2: 200/600 * 300 = 100
+    // Order 3: 300/600 * 300 = 150
+    book.addOrder(4, 4, Side::Buy, 1000000, 300, OrderType::Limit);
+
+    auto history = book.getTradeHistory();
+    assert(history.size() == 3);
+
+    // Check proportional allocation
+    uint64_t fill1 = 0, fill2 = 0, fill3 = 0;
+    for (const auto& t : history) {
+        if (t.sellOrderId == 1) fill1 += t.quantity;
+        else if (t.sellOrderId == 2) fill2 += t.quantity;
+        else if (t.sellOrderId == 3) fill3 += t.quantity;
+    }
+
+    assert(fill1 == 50);
+    assert(fill2 == 100);
+    assert(fill3 == 150);
+    assert(fill1 + fill2 + fill3 == 300);
+
+    std::cout << "testProRataMatching PASSED" << std::endl;
+}
+
+// ─── Multi-Symbol ───────────────────────────────────────────────────────────
+
+void testMultiSymbol() {
+    std::cout << "Running testMultiSymbol..." << std::endl;
+    MatchingEngine engine;
+    engine.addSymbol(1);
+    engine.addSymbol(2);
+    engine.start();
+
+    // Symbol 1: AAPL
+    engine.processOrder(1, 1, 10, Side::Sell, 1500000, 100, OrderType::Limit);
+    engine.processOrder(1, 2, 20, Side::Buy, 1500000, 50, OrderType::Limit);
+
+    // Symbol 2: GOOG
+    engine.processOrder(2, 3, 10, Side::Sell, 2800000, 200, OrderType::Limit);
+    engine.processOrder(2, 4, 20, Side::Buy, 2800000, 100, OrderType::Limit);
+
+    // Check books are independent
+    auto* book1 = engine.getOrderBook(1);
+    auto* book2 = engine.getOrderBook(2);
+
+    assert(book1 != nullptr);
+    assert(book2 != nullptr);
+
+    const Order* o1 = book1->getOrder(1);
+    assert(o1 != nullptr && o1->remainingQty == 50);
+
+    const Order* o3 = book2->getOrder(3);
+    assert(o3 != nullptr && o3->remainingQty == 100);
+
+    engine.stop();
+    std::cout << "testMultiSymbol PASSED" << std::endl;
+}
+
+void testMultiSymbolKillSwitch() {
+    std::cout << "Running testMultiSymbolKillSwitch..." << std::endl;
+    MatchingEngine engine;
+    engine.addSymbol(1);
+    engine.addSymbol(2);
+    engine.start();
+
+    // Participant 10 has orders in both symbols
+    engine.processOrder(1, 1, 10, Side::Buy, 1000000, 100, OrderType::Limit);
+    engine.processOrder(2, 2, 10, Side::Sell, 2000000, 100, OrderType::Limit);
+    engine.processOrder(1, 3, 20, Side::Buy, 990000, 100, OrderType::Limit);
+
+    // Kill switch for participant 10
+    uint64_t cancelled = engine.killSwitch(10);
+    assert(cancelled == 2);
+
+    // Participant 20's order should survive
+    assert(engine.getOrderBook(1)->getOrder(3) != nullptr);
+
+    engine.stop();
+    std::cout << "testMultiSymbolKillSwitch PASSED" << std::endl;
+}
+
+// ─── Journal / Persistence ──────────────────────────────────────────────────
+
+void testJournal() {
+    std::cout << "Running testJournal..." << std::endl;
+
+    const std::string journalPath = "/tmp/ob_test_journal.bin";
+
+    // Write
+    {
+        Journal journal(journalPath);
+        journal.logAddOrder(1, 10, 0, Side::Buy, 1000000, 100, OrderType::Limit);
+        journal.logAddOrder(2, 20, 0, Side::Sell, 1010000, 50, OrderType::Limit);
+        journal.logCancelOrder(2);
+        journal.logModifyOrder(1, 50);
+        journal.logCancelReplace(1, 1020000, 80);
+        journal.flush();
+    }
+
+    // Read back
+    {
+        Journal journal(journalPath);
+        auto entries = journal.readAll();
+        assert(entries.size() == 5);
+        assert(entries[0].entryType == JournalEntry::Type::AddOrder);
+        assert(entries[0].orderId == 1);
+        assert(entries[0].price == 1000000);
+        assert(entries[1].entryType == JournalEntry::Type::AddOrder);
+        assert(entries[2].entryType == JournalEntry::Type::CancelOrder);
+        assert(entries[2].orderId == 2);
+        assert(entries[3].entryType == JournalEntry::Type::ModifyOrder);
+        assert(entries[3].newQty == 50);
+        assert(entries[4].entryType == JournalEntry::Type::CancelReplace);
+        assert(entries[4].newPrice == 1020000);
+    }
+
+    // Cleanup
+    std::remove(journalPath.c_str());
+    std::cout << "testJournal PASSED" << std::endl;
+}
+
+void testJournalReplay() {
+    std::cout << "Running testJournalReplay..." << std::endl;
+
+    const std::string journalPath = "/tmp/ob_test_journal_replay.bin";
+
+    // Record operations
+    {
+        Journal journal(journalPath);
+        journal.logAddOrder(1, 10, 0, Side::Sell, 1000000, 100, OrderType::Limit);
+        journal.logAddOrder(2, 20, 0, Side::Buy, 1000000, 50, OrderType::Limit);
+        journal.logAddOrder(3, 30, 0, Side::Buy, 990000, 200, OrderType::Limit);
+        journal.logCancelOrder(3);
+        journal.flush();
+    }
+
+    // Replay into a fresh OrderBook
+    {
+        Journal journal(journalPath);
+        auto entries = journal.readAll();
+
+        OrderBook book;
+        for (const auto& e : entries) {
+            switch (e.entryType) {
+                case JournalEntry::Type::AddOrder:
+                    book.addOrder(e.orderId, e.participantId, e.side, e.price, e.quantity,
+                                  e.orderType, e.stopPrice, e.displayQty, e.timeInForce,
+                                  e.expiryTime, e.stopLimitPrice, e.pegType, e.pegOffset,
+                                  e.trailAmount, e.minQty, e.hidden);
+                    break;
+                case JournalEntry::Type::CancelOrder:
+                    book.cancelOrder(e.orderId);
+                    break;
+                case JournalEntry::Type::ModifyOrder:
+                    book.modifyOrder(e.orderId, e.newQty);
+                    break;
+                case JournalEntry::Type::CancelReplace:
+                    book.cancelReplace(e.orderId, e.newPrice, e.newQty);
+                    break;
+                case JournalEntry::Type::Snapshot:
+                    book.addOrder(e.orderId, e.participantId, e.side, e.price, e.quantity,
+                                  e.orderType, e.stopPrice, e.displayQty, e.timeInForce,
+                                  e.expiryTime, e.stopLimitPrice, e.pegType, e.pegOffset,
+                                  e.trailAmount, e.minQty, e.hidden);
+                    break;
+            }
+        }
+
+        // Verify replayed state
+        assert(book.getOrder(1) != nullptr);
+        assert(book.getOrder(1)->remainingQty == 50); // 100 - 50 matched
+        assert(book.getOrder(2) == nullptr); // fully matched
+        assert(book.getOrder(3) == nullptr); // cancelled
+        assert(book.getTradeHistory().size() == 1);
+    }
+
+    std::remove(journalPath.c_str());
+    std::cout << "testJournalReplay PASSED" << std::endl;
+}
+
+// ─── Market Data Callbacks ──────────────────────────────────────────────────
+
+void testMarketDataCallbacks() {
+    std::cout << "Running testMarketDataCallbacks..." << std::endl;
+    OrderBook book;
+
+    std::vector<MarketDataUpdate> mdUpdates;
+    book.setMarketDataCallback([&](const MarketDataUpdate& u) {
+        mdUpdates.push_back(u);
+    });
+
+    book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit);
+    // Should get an Add update
+    bool foundAdd = false;
+    for (const auto& u : mdUpdates) {
+        if (u.action == MarketDataUpdate::Action::Add && u.side == Side::Buy)
+            foundAdd = true;
+    }
+    assert(foundAdd);
+
+    mdUpdates.clear();
+    book.cancelOrder(1);
+    bool foundDelete = false;
+    for (const auto& u : mdUpdates) {
+        if (u.action == MarketDataUpdate::Action::Delete && u.side == Side::Buy)
+            foundDelete = true;
+    }
+    assert(foundDelete);
+
+    std::cout << "testMarketDataCallbacks PASSED" << std::endl;
+}
+
+// ─── Input Validation ───────────────────────────────────────────────────────
+
+void testInputValidation() {
+    std::cout << "Running testInputValidation..." << std::endl;
+    OrderBook book;
+
+    // Zero quantity -> reject
+    book.addOrder(1, 1, Side::Buy, 1000000, 0, OrderType::Limit);
+    assert(book.getOrder(1) == nullptr);
+
+    // Negative price for limit -> reject
+    book.addOrder(2, 1, Side::Buy, -100, 100, OrderType::Limit);
+    assert(book.getOrder(2) == nullptr);
+
+    // Market order with price 0 -> OK (market orders don't need price)
+    book.addOrder(100, 100, Side::Sell, 1000000, 50, OrderType::Limit);
+    book.addOrder(3, 1, Side::Buy, 0, 50, OrderType::Market);
+    assert(book.getOrder(100) == nullptr); // matched
+
+    std::cout << "testInputValidation PASSED" << std::endl;
+}
+
+// ─── Comprehensive Fuzz with new features ───────────────────────────────────
+
+void testFuzzWithNewFeatures(int numOps) {
+    std::cout << "Running testFuzzWithNewFeatures (" << numOps << " ops)..." << std::endl;
+    OrderBook book;
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<Price> priceDist(990, 1010);
+    std::uniform_int_distribution<int> opDist(1, 100);
+    std::uniform_int_distribution<int> typeDist(0, 5);
+    std::deque<OrderId> activeOrders;
+    OrderId nextId = 1;
+
+    for (int i = 0; i < numOps; ++i) {
+        int op = opDist(rng);
+
+        if (op <= 40) {
+            // Add various order types
+            OrderId id = nextId++;
+            activeOrders.push_back(id);
+            int t = typeDist(rng);
+            Price p = priceDist(rng) * 1000;
+            Side s = (i % 2 == 0) ? Side::Buy : Side::Sell;
+            ParticipantId pid = (i % 10) + 1;
+
+            switch(t) {
+                case 0: book.addOrder(id, pid, s, p, 100, OrderType::Limit); break;
+                case 1: book.addOrder(id, pid, s, 0, 50, OrderType::Market); break;
+                case 2: book.addOrder(id, pid, s, p, 100, OrderType::IOC); break;
+                case 3: book.addOrder(id, pid, s, p, 100, OrderType::PostOnly); break;
+                case 4: book.addOrder(id, pid, s, p, 100, OrderType::Hidden); break;
+                case 5: book.addOrder(id, pid, s, p, 100, OrderType::Iceberg, 0, 30); break;
+            }
+        } else if (op <= 70 && !activeOrders.empty()) {
+            // Cancel
+            size_t idx = rng() % activeOrders.size();
+            book.cancelOrder(activeOrders[idx]);
+            activeOrders.erase(activeOrders.begin() + idx);
+        } else if (op <= 85 && !activeOrders.empty()) {
+            // Cancel/Replace
+            size_t idx = rng() % activeOrders.size();
+            Price newP = priceDist(rng) * 1000;
+            book.cancelReplace(activeOrders[idx], newP, 50);
+        } else if (op <= 95 && !activeOrders.empty()) {
+            // Modify
+            size_t idx = rng() % activeOrders.size();
+            book.modifyOrder(activeOrders[idx], 10);
+        } else {
+            // Market order
+            OrderId id = nextId++;
+            book.addOrder(id, 99, (i % 2 == 0 ? Side::Buy : Side::Sell), 0, 50, OrderType::Market);
+        }
+
+        // Invariant: best bid < best ask
+        Price bb = book.getBestBid();
+        Price ba = book.getBestAsk();
+        if (bb != 0 && ba != std::numeric_limits<Price>::max()) {
+            assert(bb < ba);
+        }
+    }
+    std::cout << "testFuzzWithNewFeatures PASSED" << std::endl;
+}
+
+// ─── Uncross Auction (actual trade execution) ───────────────────────────────
+
+void testUncrossExecution() {
+    std::cout << "Running testUncrossExecution..." << std::endl;
+    OrderBook book;
+
+    // Build crossed book:
+    // Bids: 100@102, 50@101, 200@100
+    // Asks: 80@99, 120@100, 100@101
+    book.addOrder(1, 1, Side::Buy, 1020000, 100, OrderType::Limit);
+    book.addOrder(2, 2, Side::Buy, 1010000, 50, OrderType::Limit);
+    book.addOrder(3, 3, Side::Buy, 1000000, 200, OrderType::Limit);
+    book.addOrder(4, 4, Side::Sell, 990000, 80, OrderType::Limit);
+    book.addOrder(5, 5, Side::Sell, 1000000, 120, OrderType::Limit);
+    book.addOrder(6, 6, Side::Sell, 1010000, 100, OrderType::Limit);
+
+    size_t tradesBefore = book.getTradeHistory().size();
+    book.uncross();
+    size_t tradesAfter = book.getTradeHistory().size();
+
+    // Uncross should have generated actual trades
+    assert(tradesAfter > tradesBefore);
+
+    // All trades should be at the same uncross price
+    Price uncrossPrice = book.getTradeHistory()[tradesBefore].price;
+    for (size_t i = tradesBefore; i < tradesAfter; ++i) {
+        assert(book.getTradeHistory()[i].price == uncrossPrice);
+    }
+
+    // Verify total matched volume
+    Quantity totalTraded = 0;
+    for (size_t i = tradesBefore; i < tradesAfter; ++i) {
+        totalTraded += book.getTradeHistory()[i].quantity;
+    }
+    assert(totalTraded > 0);
+
+    std::cout << "testUncrossExecution PASSED (price=" << toDouble(uncrossPrice)
+              << ", volume=" << totalTraded << ", trades=" << (tradesAfter - tradesBefore) << ")" << std::endl;
+}
+
+// ─── Depth Limit ────────────────────────────────────────────────────────────
+
+void testDepthLimit() {
+    std::cout << "Running testDepthLimit..." << std::endl;
+    OrderBook book;
+    book.setMaxDepth(3); // max 3 price levels per side
+
+    // Add 3 bid levels — all should succeed
+    book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit);
+    book.addOrder(2, 2, Side::Buy, 990000, 100, OrderType::Limit);
+    book.addOrder(3, 3, Side::Buy, 980000, 100, OrderType::Limit);
+    assert(book.getBidLevelsCount() == 3);
+
+    // 4th bid level at new price — should be rejected (cancelled after no match)
+    book.addOrder(4, 4, Side::Buy, 970000, 100, OrderType::Limit);
+    assert(book.getOrder(4) == nullptr);
+    assert(book.getBidLevelsCount() == 3);
+
+    // Adding to an existing level should still work
+    book.addOrder(5, 5, Side::Buy, 1000000, 50, OrderType::Limit);
+    assert(book.getOrder(5) != nullptr);
+    assert(book.getBidLevelsCount() == 3);
+
+    // Same for asks
+    book.addOrder(10, 10, Side::Sell, 1010000, 100, OrderType::Limit);
+    book.addOrder(11, 11, Side::Sell, 1020000, 100, OrderType::Limit);
+    book.addOrder(12, 12, Side::Sell, 1030000, 100, OrderType::Limit);
+    assert(book.getAskLevelsCount() == 3);
+
+    book.addOrder(13, 13, Side::Sell, 1040000, 100, OrderType::Limit);
+    assert(book.getOrder(13) == nullptr);
+    assert(book.getAskLevelsCount() == 3);
+
+    std::cout << "testDepthLimit PASSED" << std::endl;
+}
+
+// ─── Journal CRC Validation ─────────────────────────────────────────────────
+
+void testJournalCRC() {
+    std::cout << "Running testJournalCRC..." << std::endl;
+    const std::string path = "/tmp/ob_test_crc.bin";
+
+    // Write valid entries
+    {
+        Journal journal(path);
+        journal.logAddOrder(1, 10, 0, Side::Buy, 1000000, 100, OrderType::Limit);
+        journal.logAddOrder(2, 20, 0, Side::Sell, 1010000, 50, OrderType::Limit);
+        journal.flush();
+    }
+
+    // Read with CRC validation — should get 2 entries
+    {
+        Journal journal(path);
+        auto entries = journal.readAll(true);
+        assert(entries.size() == 2);
+    }
+
+    // Corrupt the file by flipping a byte
+    {
+        FILE* f = std::fopen(path.c_str(), "r+b");
+        assert(f);
+        // Seek to middle of first entry and flip a byte
+        std::fseek(f, 20, SEEK_SET);
+        uint8_t byte;
+        std::fread(&byte, 1, 1, f);
+        byte ^= 0xFF;
+        std::fseek(f, 20, SEEK_SET);
+        std::fwrite(&byte, 1, 1, f);
+        std::fclose(f);
+    }
+
+    // Read with CRC validation — should detect corruption and stop at entry 0
+    {
+        Journal journal(path);
+        auto entries = journal.readAll(true);
+        assert(entries.size() == 0); // first entry corrupted, stops reading
+    }
+
+    // Read without CRC validation — should still get 2 entries
+    {
+        Journal journal(path);
+        auto entries = journal.readAll(false);
+        assert(entries.size() == 2);
+    }
+
+    std::remove(path.c_str());
+    std::cout << "testJournalCRC PASSED" << std::endl;
+}
+
+// ─── Journal Snapshot ───────────────────────────────────────────────────────
+
+void testJournalSnapshot() {
+    std::cout << "Running testJournalSnapshot..." << std::endl;
+    const std::string path = "/tmp/ob_test_snapshot.bin";
+
+    // Build some book state
+    OrderBook book;
+    book.addOrder(1, 10, Side::Sell, 1000000, 100, OrderType::Limit);
+    book.addOrder(2, 20, Side::Buy, 1000000, 30, OrderType::Limit);
+    // Order 1 now has 70 remaining
+
+    book.addOrder(3, 30, Side::Buy, 990000, 200, OrderType::Limit);
+
+    // Write snapshot
+    {
+        Journal journal(path);
+        auto orders = book.getAllOrders();
+        for (const auto* o : orders) {
+            journal.logSnapshot(o->id, o->participantId, o->symbolId,
+                                o->side, o->price, o->remainingQty, o->type,
+                                o->timeInForce, o->expiryTime, o->stopPrice,
+                                o->stopLimitPrice, o->displayQty, o->pegType,
+                                o->pegOffset, o->trailAmount, o->minQty, o->isHidden);
+        }
+        journal.flush();
+    }
+
+    // Replay snapshot into fresh book
+    {
+        Journal journal(path);
+        auto entries = journal.readAll();
+
+        OrderBook newBook;
+        for (const auto& e : entries) {
+            if (e.entryType == JournalEntry::Type::Snapshot) {
+                newBook.addOrder(e.orderId, e.participantId, e.side, e.price,
+                                e.quantity, e.orderType, e.stopPrice, e.displayQty,
+                                e.timeInForce, e.expiryTime, e.stopLimitPrice,
+                                e.pegType, e.pegOffset, e.trailAmount, e.minQty, e.hidden);
+            }
+        }
+
+        // Verify state matches
+        const Order* o1 = newBook.getOrder(1);
+        assert(o1 != nullptr);
+        assert(o1->remainingQty == 70);
+
+        const Order* o3 = newBook.getOrder(3);
+        assert(o3 != nullptr);
+        assert(o3->remainingQty == 200);
+    }
+
+    std::remove(path.c_str());
+    std::cout << "testJournalSnapshot PASSED" << std::endl;
+}
+
+// ─── Async Engine ───────────────────────────────────────────────────────────
+
+void testAsyncEngine() {
+    std::cout << "Running testAsyncEngine..." << std::endl;
+    MatchingEngine engine;
+    engine.addSymbol(1);
+    engine.startAsync(-1, 1024); // no CPU pinning, 1K queue
+
+    // Submit orders asynchronously
+    engine.processOrder(1, 1, 10, Side::Sell, 1000000, 100, OrderType::Limit);
+    engine.processOrder(1, 2, 20, Side::Buy, 1000000, 100, OrderType::Limit);
+    engine.processOrder(1, 3, 30, Side::Sell, 1010000, 200, OrderType::Limit);
+    engine.processOrder(1, 4, 40, Side::Buy, 1010000, 50, OrderType::Limit);
+
+    // Wait for all to be processed
+    engine.waitForDrain();
+
+    // Verify results
+    auto* book = engine.getOrderBook(1);
+    assert(book != nullptr);
+
+    // Order 1 & 2: matched (both gone)
+    assert(book->getOrder(1) == nullptr);
+    assert(book->getOrder(2) == nullptr);
+
+    // Order 3: partially filled (200 - 50 = 150 remaining)
+    const Order* o3 = book->getOrder(3);
+    assert(o3 != nullptr);
+    assert(o3->remainingQty == 150);
+
+    // Order 4: fully filled
+    assert(book->getOrder(4) == nullptr);
+
+    assert(engine.getProcessedCount() == 4);
+
+    engine.stopAsync();
+    std::cout << "testAsyncEngine PASSED" << std::endl;
+}
+
+void testAsyncCancelReplace() {
+    std::cout << "Running testAsyncCancelReplace..." << std::endl;
+    MatchingEngine engine;
+    engine.startAsync(-1, 1024);
+
+    // Add order via async
+    engine.processOrder(0, 1, 10, Side::Buy, 1000000, 100, OrderType::Limit);
+    engine.waitForDrain();
+
+    // Cancel via async
+    engine.cancelOrder(0, 1);
+    engine.waitForDrain();
+
+    auto* book = engine.getOrderBook(0);
+    assert(book->getOrder(1) == nullptr);
+
+    engine.stopAsync();
+    std::cout << "testAsyncCancelReplace PASSED" << std::endl;
+}
+
+// ─── FIX Protocol ───────────────────────────────────────────────────────────
+
+void testFIXParsing() {
+    std::cout << "Running testFIXParsing..." << std::endl;
+
+    // Build a FIX message using pipe delimiter for readability
+    std::string raw = "8=FIX.4.4|9=100|35=D|11=12345|1=100|55=1|54=1|44=150.2500|38=200|40=2|59=1|10=000|";
+
+    auto msg = FIXMessage::parse(raw);
+
+    assert(msg.getField(FIXTag::MsgType) == "D");
+    assert(msg.getInt(FIXTag::ClOrdID) == 12345);
+    assert(msg.getInt(FIXTag::Account) == 100);
+    assert(msg.getInt(FIXTag::Symbol) == 1);
+    assert(msg.getInt(FIXTag::Side) == 1); // Buy
+    assert(std::abs(msg.getDouble(FIXTag::Price) - 150.25) < 0.001);
+    assert(msg.getInt(FIXTag::OrderQty) == 200);
+    assert(msg.getField(FIXTag::OrdType) == "2"); // Limit
+    assert(msg.getInt(FIXTag::TimeInForce) == 1); // GTC
+
+    std::cout << "testFIXParsing PASSED" << std::endl;
+}
+
+void testFIXAdapter() {
+    std::cout << "Running testFIXAdapter..." << std::endl;
+
+    // Test NewOrderSingle parsing
+    std::string raw = "35=D|11=42|1=10|55=1|54=1|44=100.0000|38=500|40=2|59=1|";
+    auto msg = FIXMessage::parse(raw);
+    auto params = FIXAdapter::parseNewOrder(msg);
+
+    assert(params.orderId == 42);
+    assert(params.participantId == 10);
+    assert(params.symbolId == 1);
+    assert(params.side == Side::Buy);
+    assert(params.price == 1000000); // 100.0000 * 10000
+    assert(params.qty == 500);
+    assert(params.type == OrderType::Limit);
+    assert(params.tif == TimeInForce::GTC);
+
+    // Test IOC via TimeInForce
+    std::string rawIOC = "35=D|11=43|1=20|55=2|54=2|44=50.0000|38=100|40=2|59=3|";
+    auto msgIOC = FIXMessage::parse(rawIOC);
+    auto paramsIOC = FIXAdapter::parseNewOrder(msgIOC);
+    assert(paramsIOC.type == OrderType::IOC);
+    assert(paramsIOC.side == Side::Sell);
+
+    // Test Iceberg (MaxFloor set)
+    std::string rawIce = "35=D|11=44|1=30|55=1|54=1|44=100.0000|38=1000|40=2|59=1|111=200|";
+    auto msgIce = FIXMessage::parse(rawIce);
+    auto paramsIce = FIXAdapter::parseNewOrder(msgIce);
+    assert(paramsIce.type == OrderType::Iceberg);
+    assert(paramsIce.displayQty == 200);
+
+    // Test Cancel parsing
+    std::string rawCancel = "35=F|11=42|55=1|";
+    auto msgCancel = FIXMessage::parse(rawCancel);
+    auto cancelParams = FIXAdapter::parseCancelRequest(msgCancel);
+    assert(cancelParams.orderId == 42);
+    assert(cancelParams.symbolId == 1);
+
+    // Test CancelReplace parsing
+    std::string rawCR = "35=G|41=42|55=1|44=105.0000|38=300|";
+    auto msgCR = FIXMessage::parse(rawCR);
+    auto crParams = FIXAdapter::parseCancelReplace(msgCR);
+    assert(crParams.origOrderId == 42);
+    assert(crParams.newPrice == 1050000);
+    assert(crParams.newQty == 300);
+
+    // Test ExecutionReport building
+    Trade trade{};
+    trade.tradeId = 1;
+    trade.buyOrderId = 42;
+    trade.sellOrderId = 43;
+    trade.price = 1000000;
+    trade.quantity = 100;
+    trade.symbolId = 1;
+    auto report = FIXAdapter::buildTradeReport(trade);
+    assert(report.getField(FIXTag::MsgType) == "8");
+    assert(report.getField(FIXTag::ExecType) == "F");
+    assert(std::abs(report.getDouble(FIXTag::LastPx) - 100.0) < 0.001);
+
+    // Test building FIX string
+    std::string fixStr = report.build("EXCHANGE", "CLIENT");
+    assert(fixStr.find("35=8") != std::string::npos);
+    assert(fixStr.find("8=FIX.4.4") != std::string::npos);
+    assert(fixStr.find("10=") != std::string::npos);
+
+    std::cout << "testFIXAdapter PASSED" << std::endl;
+}
+
+void testFIXEndToEnd() {
+    std::cout << "Running testFIXEndToEnd..." << std::endl;
+
+    OrderBook book(1);
+
+    // Parse FIX NewOrderSingle and submit to book
+    std::string fixSell = "35=D|11=1|1=10|55=1|54=2|44=100.0000|38=100|40=2|59=1|";
+    auto sellMsg = FIXMessage::parse(fixSell);
+    auto sellParams = FIXAdapter::parseNewOrder(sellMsg);
+    book.addOrder(sellParams.orderId, sellParams.participantId, sellParams.side,
+                  sellParams.price, sellParams.qty, sellParams.type);
+
+    std::string fixBuy = "35=D|11=2|1=20|55=1|54=1|44=100.0000|38=100|40=2|59=1|";
+    auto buyMsg = FIXMessage::parse(fixBuy);
+    auto buyParams = FIXAdapter::parseNewOrder(buyMsg);
+    book.addOrder(buyParams.orderId, buyParams.participantId, buyParams.side,
+                  buyParams.price, buyParams.qty, buyParams.type);
+
+    // Should match
+    assert(book.getOrder(1) == nullptr);
+    assert(book.getOrder(2) == nullptr);
+    assert(book.getTradeHistory().size() == 1);
+    assert(book.getTradeHistory()[0].price == 1000000);
+
+    std::cout << "testFIXEndToEnd PASSED" << std::endl;
+}
+
+// ─── Get All Orders ─────────────────────────────────────────────────────────
+
+void testGetAllOrders() {
+    std::cout << "Running testGetAllOrders..." << std::endl;
+    OrderBook book;
+
+    book.addOrder(1, 1, Side::Buy, 1000000, 100, OrderType::Limit);
+    book.addOrder(2, 2, Side::Sell, 1010000, 100, OrderType::Limit);
+    book.addOrder(3, 3, Side::Buy, 990000, 50, OrderType::Limit);
+
+    auto orders = book.getAllOrders();
+    assert(orders.size() == 3);
+
+    // Cancel one
+    book.cancelOrder(2);
+    orders = book.getAllOrders();
+    assert(orders.size() == 2);
+
+    std::cout << "testGetAllOrders PASSED" << std::endl;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════════════════
+
 int main() {
     try {
+        // Original tests
         testBasicMatching();
         testSMP();
         testSMPPurity();
@@ -320,7 +1486,36 @@ int main() {
         testCircuitBreakerBoundaries();
         testStress();
         testPartialFillPriority();
-        testFuzz(100000); 
+        testFuzz(100000);
+
+        // New feature tests
+        testStopLimitOrder();
+        testPostOnly();
+        testHiddenOrders();
+        testCancelReplace();
+        testCancelReplaceCrossing();
+        testKillSwitch();
+        testGTDExpiry();
+        testDAYExpiry();
+        testRiskLimits();
+        testMarketDataSnapshot();
+        testMarketDataHidesHiddenOrders();
+        testOrderStatusCallbacks();
+        testOrderStatusRejection();
+        testTrailingStopSell();
+        testTrailingStopBuy();
+        testPeggedMidPrice();
+        testPeggedPrimaryPeg();
+        testMinQty();
+        testProRataMatching();
+        testMultiSymbol();
+        testMultiSymbolKillSwitch();
+        testJournal();
+        testJournalReplay();
+        testMarketDataCallbacks();
+        testInputValidation();
+        testFuzzWithNewFeatures(100000);
+
         std::cout << "\nALL TESTS PASSED!" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Test failed with exception: " << e.what() << std::endl;
